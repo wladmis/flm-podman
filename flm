@@ -1,0 +1,180 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Wladmis
+# SPDX-License-Identifier: MIT
+
+set -eu
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+image=${FLM_IMAGE:-fastflowlm:latest}
+config_dir=${HOME:?HOME must be set}/.config/flm
+
+usage() {
+    printf '%s\n' \
+        "Usage: $0 build | <flm command> [arguments...]" \
+        "Set FLM_IMAGE to select another local image tag."
+}
+
+build_image() {
+    podman build --pull=always --no-cache \
+        --tag "$image" \
+        --file "$repo_dir/Containerfile" \
+        "$repo_dir"
+}
+
+ensure_image() {
+    if ! podman image exists "$image"; then
+        build_image
+    fi
+}
+
+server_port() {
+    port=52625
+    next_is_port=false
+
+    for arg do
+        if [ "$next_is_port" = true ]; then
+            port=$arg
+            next_is_port=false
+            continue
+        fi
+
+        case $arg in
+            --port|-p)
+                next_is_port=true
+                ;;
+            --port=*)
+                port=${arg#--port=}
+                ;;
+            -p?*)
+                port=${arg#-p}
+                ;;
+            --host|--host=*)
+                printf '%s\n' \
+                    'Do not set --host: the container must listen on 0.0.0.0.' >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [ "$next_is_port" = true ]; then
+        printf '%s\n' 'Missing value for --port or -p.' >&2
+        exit 2
+    fi
+
+    case $port in
+        ''|*[!0-9]*)
+            printf '%s\n' 'Server port must be a number.' >&2
+            exit 2
+            ;;
+    esac
+
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        printf '%s\n' 'Server port must be between 1 and 65535.' >&2
+        exit 2
+    fi
+
+    printf '%s\n' "$port"
+}
+
+require_npu() {
+    if [ ! -e /dev/accel/accel0 ]; then
+        printf '%s\n' \
+            'FastFlowLM NPU device /dev/accel/accel0 is missing.' \
+            'Install and configure the AMD NPU driver on the host.' >&2
+        exit 1
+    fi
+}
+
+container_command() {
+    action=$1
+    shift
+
+    if [ -e /dev/accel/accel0 ]; then
+        exec podman "$action" \
+            --runtime crun \
+            --device /dev/accel/accel0 \
+            --group-add keep-groups \
+            --ulimit memlock=-1:-1 \
+            --volume "$config_dir:/root/.config/flm:z" \
+            "$@"
+    fi
+
+    exec podman "$action" \
+        --volume "$config_dir:/root/.config/flm:z" \
+        "$@"
+}
+
+cleanup_server() {
+    trap - EXIT INT TERM
+    podman stop --time 5 "$container_id" >/dev/null 2>&1 || :
+    if ! podman rm --force "$container_id" >/dev/null 2>&1; then
+        printf 'Could not remove container %s\n' "$container_id" >&2
+    fi
+    if [ -n "${logs_pid:-}" ]; then
+        kill "$logs_pid" 2>/dev/null || :
+        wait "$logs_pid" 2>/dev/null || :
+    fi
+}
+
+serve_flm() {
+    container_id=$(container_command create --stop-signal SIGINT \
+        --publish "127.0.0.1:$port:$port" \
+        "$image" flm serve "$@" --host 0.0.0.0)
+
+    trap 'cleanup_server' EXIT
+    trap 'printf "%s\n" "Stopping FastFlowLM..." >&2; exit 130' INT
+    trap 'exit 143' TERM
+
+    podman start "$container_id" >/dev/null
+    podman logs --follow "$container_id" &
+    logs_pid=$!
+    wait "$logs_pid"
+    status=$(podman wait "$container_id")
+    exit "$status"
+}
+
+if [ "$#" -lt 1 ]; then
+    usage >&2
+    exit 2
+fi
+
+command=$1
+shift
+
+case $command in
+    build)
+        if [ "$#" -ne 0 ]; then
+            usage >&2
+            exit 2
+        fi
+        build_image
+        exit
+        ;;
+    --help)
+        usage
+        exit
+        ;;
+    serve)
+        require_npu
+        port=$(server_port "$@")
+        ;;
+    run)
+        require_npu
+        ;;
+esac
+
+ensure_image
+mkdir -p "$config_dir"
+
+case $command in
+    serve)
+        serve_flm "$@"
+        ;;
+    run)
+        container_command run --rm --interactive --tty \
+            "$image" flm "$command" "$@"
+        ;;
+    *)
+        container_command run --rm "$image" flm "$command" "$@"
+        ;;
+esac
