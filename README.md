@@ -23,6 +23,14 @@ Build or refresh the image, downloading the latest release package:
 ./flm build
 ```
 
+From the repository root, symlink the script into a directory on your
+`PATH` to run `flm` from anywhere:
+
+```sh
+ln -sf "$(pwd -P)/flm" ~/bin/flm
+flm build
+```
+
 List supported and downloaded models:
 
 ```sh

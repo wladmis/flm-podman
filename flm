@@ -4,7 +4,12 @@
 
 set -eu
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_path=$0
+case $script_path in
+    */*) ;;
+    *) script_path=$(command -v "$script_path") ;;
+esac
+repo_dir=$(dirname -- "$(readlink -f -- "$script_path")")
 image=${FLM_IMAGE:-fastflowlm:latest}
 config_dir=${HOME:?HOME must be set}/.config/flm
 
@@ -15,6 +20,13 @@ usage() {
 }
 
 build_image() {
+    if [ ! -f "$repo_dir/Containerfile" ]; then
+        printf 'Containerfile missing from %s.\n' "$repo_dir" >&2
+        printf '%s\n' \
+            'Run flm from the repository or symlink its script into PATH.' >&2
+        exit 1
+    fi
+
     podman build --pull=always --no-cache \
         --tag "$image" \
         --file "$repo_dir/Containerfile" \
